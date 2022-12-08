@@ -27,7 +27,7 @@ import collections
 
 from .parameterized import (
     Parameterized, Parameter, String, ParameterizedFunction, ParamOverrides,
-    descendents, get_logger, instance_descriptor, basestring)
+    descendents, get_logger, instance_descriptor, basestring, dt_types)
 
 from .parameterized import (batch_watch, depends, output, script_repr, # noqa: api import
                             discard_events, edit_constant, instance_descriptor)
@@ -46,16 +46,6 @@ try:
     __version__ = str(Version(fpath=__file__, archive_commit="$Format:%h$", reponame="param"))
 except:
     __version__ = "0.0.0+unknown"
-
-
-dt_types = (dt.datetime, dt.date)
-
-try:
-    import numpy as np
-    dt_types = dt_types + (np.datetime64,)
-except:
-    pass
-
 
 try:
     import collections.abc as collections_abc
@@ -123,6 +113,7 @@ def hashable(x):
     else:
         return x
 
+
 def named_objs(objlist, namesdict=None):
     """
     Given a list of objects, returns a dictionary mapping from
@@ -132,12 +123,20 @@ def named_objs(objlist, namesdict=None):
     """
     objs = OrderedDict()
 
+    objtoname = {}
+    unhashables = []
     if namesdict is not None:
-        objtoname = {hashable(v): k for k, v in namesdict.items()}
+        for k, v in namesdict.items():
+            try:
+                objtoname[hashable(v)] = k
+            except TypeError:
+                unhashables.append((k, v))
 
     for obj in objlist:
-        if namesdict is not None and hashable(obj) in objtoname:
+        if objtoname and hashable(obj) in objtoname:
             k = objtoname[hashable(obj)]
+        elif any(obj is v for (_, v) in unhashables):
+            k = [k for (k, v) in unhashables if v is obj][0]
         elif hasattr(obj, "name"):
             k = obj.name
         elif hasattr(obj, '__name__'):
@@ -195,24 +194,29 @@ def guess_param_types(**kwargs):
         elif isinstance(v, tuple):
             if all(_is_number(el) for el in v):
                 params[k] = NumericTuple(**kws)
-            elif all(isinstance(el. dt_types) for el in v) and len(v)==2:
+            elif all(isinstance(el, dt_types) for el in v) and len(v)==2:
                 params[k] = DateRange(**kws)
             else:
                 params[k] = Tuple(**kws)
         elif isinstance(v, list):
             params[k] = List(**kws)
-        elif isinstance(v, np.ndarray):
-            params[k] = Array(**kws)
         else:
-            from pandas import DataFrame as pdDFrame
-            from pandas import Series as pdSeries
-
-            if isinstance(v, pdDFrame):
-                params[k] = DataFrame(**kws)
-            elif isinstance(v, pdSeries):
-                params[k] = Series(**kws)
-            else:
-                params[k] = Parameter(**kws)
+            if 'numpy' in sys.modules:
+                from numpy import ndarray
+                if isinstance(v, ndarray):
+                    params[k] = Array(**kws)
+                    continue
+            if 'pandas' in sys.modules:
+                from pandas import (
+                    DataFrame as pdDFrame, Series as pdSeries
+                )
+                if isinstance(v, pdDFrame):
+                    params[k] = DataFrame(**kws)
+                    continue
+                elif isinstance(v, pdSeries):
+                    params[k] = Series(**kws)
+                    continue
+            params[k] = Parameter(**kws)
 
     return params
 
@@ -894,7 +898,7 @@ class Number(Dynamic):
 
     def _validate_step(self, val, step):
         if step is not None and not _is_number(step):
-            raise ValueError("Step parameter can only be None or a "
+            raise ValueError("Step can only be None or a "
                              "numeric value, not type %r." % type(step))
 
     def _validate(self, val):
@@ -936,7 +940,7 @@ class Integer(Number):
 
     def _validate_step(self, val, step):
         if step is not None and not isinstance(step, int):
-            raise ValueError("Step parameter can only be None or an "
+            raise ValueError("Step can only be None or an "
                              "integer value, not type %r" % type(step))
 
 
@@ -1931,7 +1935,7 @@ class Date(Number):
     def _validate_step(self, val, step):
         if step is not None and not isinstance(step, dt_types):
             raise ValueError(
-                "Step parameter can only be None, a datetime "
+                "Step can only be None, a datetime "
                 "or datetime type, not type %r." % type(val)
             )
 
@@ -1952,7 +1956,7 @@ class Date(Number):
 
 class CalendarDate(Number):
     """
-    CalendarDate parameter of date type.
+    Parameter specifically allowing dates (not datetimes).
     """
 
     def __init__(self, default=None, **kwargs):
@@ -1971,7 +1975,7 @@ class CalendarDate(Number):
 
     def _validate_step(self, val, step):
         if step is not None and not isinstance(step, dt.date):
-            raise ValueError("Step parameter can only be None or a date type.")
+            raise ValueError("Step can only be None or a date type.")
 
     @classmethod
     def serialize(cls, value):
@@ -2112,14 +2116,20 @@ class DateRange(Range):
     """
 
     def _validate_value(self, val, allow_None):
+        # Cannot use super()._validate_value as DateRange inherits from
+        # NumericTuple which check that the tuple values are numbers and
+        # datetime objects aren't numbers.
         if allow_None and val is None:
             return
 
+        if not isinstance(val, tuple):
+            raise ValueError("DateRange parameter %r only takes a tuple value, "
+                             "not %s." % (self.name, type(val).__name__))
         for n in val:
             if isinstance(n, dt_types):
                 continue
-            raise ValueError("DateRange parameter %r only takes datetime "
-                             "types, not %r." % (self.name, type(val)))
+            raise ValueError("DateRange parameter %r only takes date/datetime "
+                             "values, not type %s." % (self.name, type(n).__name__))
 
         start, end = val
         if not end >= start:
@@ -2127,7 +2137,37 @@ class DateRange(Range):
                              "is before start datetime %s." %
                              (self.name, val[1], val[0]))
 
+    @classmethod
+    def serialize(cls, value):
+        if value is None:
+            return 'null'
+        # List as JSON has no tuple representation
+        serialized = []
+        for v in value:
+            if not isinstance(v, (dt.datetime, dt.date)): # i.e np.datetime64
+                v = v.astype(dt.datetime)
+            # Separate date and datetime to deserialize to the right type.
+            if type(v) == dt.date:
+                v = v.strftime("%Y-%m-%d")
+            else:
+                v = v.strftime("%Y-%m-%dT%H:%M:%S.%f")
+            serialized.append(v)
+        return serialized
 
+    def deserialize(cls, value):
+        if value == 'null':
+            return None
+        deserialized = []
+        for v in value:
+            # Date
+            if len(v) == 10:
+                v = dt.datetime.strptime(v, "%Y-%m-%d").date()
+            # Datetime
+            else:
+                v = dt.datetime.strptime(v, "%Y-%m-%dT%H:%M:%S.%f")
+            deserialized.append(v)
+        # As JSON has no tuple representation
+        return tuple(deserialized)
 
 class CalendarDateRange(Range):
     """
@@ -2147,6 +2187,20 @@ class CalendarDateRange(Range):
             raise ValueError("CalendarDateRange parameter %r's end date "
                              "%s is before start date %s." %
                              (self.name, val[1], val[0]))
+
+    @classmethod
+    def serialize(cls, value):
+        if value is None:
+            return 'null'
+        # As JSON has no tuple representation
+        return [v.strftime("%Y-%m-%d") for v in value]
+
+    @classmethod
+    def deserialize(cls, value):
+        if value == 'null':
+            return None
+        # As JSON has no tuple representation
+        return tuple([dt.datetime.strptime(v, "%Y-%m-%d").date() for v in value])
 
 
 class Event(Boolean):
